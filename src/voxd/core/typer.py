@@ -8,6 +8,10 @@ from voxd.utils.libw import verbo
 import pyperclip  # New: clipboard helper for instant paste
 from pathlib import Path
 
+def _needs_clipboard_paste(text: str) -> bool:
+    return any(ord(ch) > 127 for ch in text)
+
+
 def detect_backend():
     """
     Return a best-guess of the active graphical backend.
@@ -223,19 +227,68 @@ class SimulatedTyper:
             verbo(f"[typer] Failed to auto-start ydotool daemon: {e}")
             return False
 
-    def _run_tool(self, cmd: list[str]):
-        """Run *cmd* catching FileNotFoundError so GUI won't freeze."""
+    def _run_tool(self, cmd: list[str]) -> bool:
+        """Run *cmd* catching FileNotFoundError so GUI won't freeze.
+
+        Returns True on exit code 0. Stderr is captured and shown on
+        failure so flaky typing can actually be diagnosed.
+        """
         try:
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=10)
             if result.returncode != 0:
-                print(f"[typer] ⚠️ Typing tool exited with code {result.returncode}")
+                lines = (result.stderr or "").strip().splitlines()
+                tail = " | ".join(lines[-3:]) if lines else "no error output"
+                print(f"[typer] ⚠️ Typing tool exited with code {result.returncode}: {tail}")
+                return False
+            return True
         except subprocess.TimeoutExpired:
-            print(f"[typer] ⚠️ Typing tool timed out after 10 seconds")
+            print("[typer] ⚠️ Typing tool timed out after 10 seconds")
+            return False
         except FileNotFoundError:
             print(f"[typer] ⚠️ Typing tool executable not found: {cmd[0]} – falling back to clipboard only.")
             self.enabled = False
+            return False
         except Exception as e:
             print(f"[typer] ⚠️ Typing tool failed: {e}")
+            return False
+
+    def _ensure_daemon(self) -> bool:
+        """Re-check the typing daemon before a retry, auto-starting once."""
+        if not self.tool or "ydotool" not in os.path.basename(self.tool):
+            return True
+        if self._check_ydotool_daemon():
+            return True
+        print("[typer] ⚠️ ydotool daemon not responding – attempting restart...")
+        try:
+            if self._auto_start_ydotool_daemon():
+                return self._check_ydotool_daemon()
+        except Exception as e:
+            verbo(f"[typer] Daemon restart failed: {e}")
+        return False
+
+    def _type_via_tool(self, t: str) -> bool:
+        """Type *t* with real keystrokes. Returns True on success."""
+        tool_name = os.path.basename(self.tool) if self.tool else ""
+        if tool_name == "ydotool" and self.tool:
+            cmd = [self.tool, "type", "-d", self.delay_str]
+        elif tool_name == "xdotool" and self.tool:
+            cmd = [self.tool, "type", "--delay", self.delay_str]
+        else:
+            print("[typer] ⚠️ No valid typing tool found.")
+            return False
+        # Guard text starting with '-': otherwise it is parsed as a flag.
+        if t.startswith("-"):
+            cmd += ["--", t]
+        else:
+            cmd += [t]
+        return self._run_tool(cmd)
+
+    def _typing_mode(self) -> str:
+        try:
+            mode = str(self.cfg.data.get("typing_mode", "auto")).strip().lower() if self.cfg else "auto"
+        except Exception:
+            mode = "auto"
+        return mode if mode in ("auto", "type", "paste") else "auto"
 
     def flush_stdin(self):
         """Force clear stdin buffer using terminal control"""
@@ -255,8 +308,18 @@ class SimulatedTyper:
             print("[typer] ⚠️ Typing disabled - required tool not available.")
             return
 
-        # If delay ≤ 0, or typing tool is missing, use fast clipboard paste instead of typing
-        if self.delay_ms <= 0 or not self.tool:
+        mode = self._typing_mode()
+
+        # Legacy instant-paste and explicit paste mode.
+        if self.delay_ms <= 0 or not self.tool or mode == "paste":
+            self._paste(text)
+            return
+
+        # ydotool/xdotool `type` simulates keycodes on a Latin layout and
+        # silently drops non-ASCII letters (e.g. Cyrillic), leaving only
+        # ASCII punctuation/digits. In auto mode such text goes through the
+        # clipboard paste path which is layout-independent.
+        if mode == "auto" and _needs_clipboard_paste(text):
             self._paste(text)
             return
 
@@ -277,21 +340,23 @@ class SimulatedTyper:
         except Exception:
             t = t
 
-        verbo(f"[typer] Typing transcript using {self.tool}...")
-        tool_name = os.path.basename(self.tool) if self.tool else ""
-        if tool_name == "ydotool" and self.tool:
-            self._run_tool([self.tool, "type", "-d", self.delay_str, t])
-        elif tool_name == "xdotool" and self.tool:
-            self._run_tool([self.tool, "type", "--delay", self.delay_str, t])
-        else:
-            print("[typer] ⚠️ No valid typing tool found.")
-            return
-        self.flush_stdin() # Flush pending input before any new prompt
+        verbo(f"[typer] Typing transcript using {self.tool} (mode={mode})...")
+        for attempt in range(1, 4):
+            if attempt > 1:
+                time.sleep(0.3)
+                if not self._ensure_daemon():
+                    break
+                print(f"[typer] Retrying keystroke typing (attempt {attempt}/3)...")
+            if self._type_via_tool(t):
+                self.flush_stdin()  # Flush pending input before any new prompt
+                return
+        print("[typer] ⚠️ Keystroke typing failed – pasting from clipboard instead.")
+        self._paste(text)
 
     # ------------------------------------------------------------------
     # Helper: fast clipboard paste
     # ------------------------------------------------------------------
-    def _paste(self, text: str):
+    def _paste(self, text: str, _from_fallback: bool = False):
         """Copy *text* to clipboard and use Ctrl+Shift+V (default) or Ctrl+V (when enabled)"""
         # Copy to clipboard first
         try:
@@ -304,7 +369,9 @@ class SimulatedTyper:
             pyperclip.copy(t)
         except Exception as e:
             verbo(f"[typer] Clipboard copy failed: {e} – falling back to typing mode.")
-            self._type_char_by_char(text)
+            if _from_fallback or _needs_clipboard_paste(text):
+                return
+            self._type_char_by_char(text, _from_paste=True)
             return
 
         # Allow clipboard daemon to update and window to process modifiers
@@ -341,7 +408,8 @@ class SimulatedTyper:
                                    timeout=5)
             else:
                 print(f"[typer] ⚠️ Paste shortcut not supported for tool: {self.tool}")
-                self._type_char_by_char(text)
+                if not _from_fallback and not _needs_clipboard_paste(text):
+                    self._type_char_by_char(text, _from_paste=True)
                 return
                 
         except subprocess.TimeoutExpired:
@@ -351,10 +419,15 @@ class SimulatedTyper:
 
         self.flush_stdin()
 
-    def _type_char_by_char(self, text: str):
+    def _type_char_by_char(self, text: str, _from_paste: bool = False):
         """Fallback method to type character by character without recursion"""
         if not self.enabled:
             print("[typer] ⚠️ Typing disabled - required tool not available.")
+            return
+        if _needs_clipboard_paste(text):
+            if _from_paste:
+                return
+            self._paste(text, _from_fallback=True)
             return
         
         # Give the window manager a moment to process key-release events
@@ -374,13 +447,14 @@ class SimulatedTyper:
             pass
 
         verbo(f"[typer] Typing transcript character-by-character using {self.tool}...")
-        tool_name = os.path.basename(self.tool) if self.tool else ""
-        if tool_name == "ydotool" and self.tool:
-            self._run_tool([self.tool, "type", "-d", "10", t])  # Use 10ms delay for fallback
-        elif tool_name == "xdotool" and self.tool:
-            self._run_tool([self.tool, "type", "--delay", "10", t])  # Use 10ms delay for fallback
-        else:
-            print("[typer] ⚠️ No valid typing tool found for fallback.")
+        saved_delay = self.delay_str
+        self.delay_str = "10"  # Use 10ms delay for fallback
+        try:
+            ok = self._type_via_tool(t)
+        finally:
+            self.delay_str = saved_delay
+        if not ok:
+            print("[typer] ⚠️ Fallback typing failed.")
             return
-        
+
         self.flush_stdin()

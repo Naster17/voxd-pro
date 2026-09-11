@@ -8,6 +8,18 @@ Using <span style="color:#FF4500">**LOCAL** (offline)</span> voice processing, w
 Runs fine even on older CPUs. No GPU required.
 
 Hit your <span style="color:#FF4500">**hotkey shortcut**</span> -> speak -> hotkey again -> watch your words appear wherever the cursor currently is, even AI-rewritten as a poem or a C++ code.  
+
+## voxd-pro — what's new in this fork
+
+Fork of [jakovius/voxd](https://github.com/jakovius/voxd) with the following fixes and features:
+
+- **Dictation queue** — the hotkey works even while an item is transcribing/typing; finished recordings wait their turn (FIFO) and are typed in order. The GUI shows `Recording (+N queued)` plus an orange `Queued: N` indicator.
+- **`--translate LANG`** — forced output language: speak anything, type the translation (e.g. `voxd --gui --translate ru` types Russian whatever you say). Target `en` uses whisper's native `--translate` (fast, offline, auto-detects source); other targets go through the AIPP LLM provider. A bare `--translate` uses the configured language; also settable via Settings → "Translate to".
+- **Typing modes + reliability** — `typing_mode`: `auto` (real keystrokes for Latin, clipboard paste for the rest), `type` (force real keystrokes), `paste` (always clipboard). Keystroke typing retries 3× with daemon health-check/restart, prints tool errors instead of swallowing them, guards text starting with `-`, and falls back to paste; the window minimizes at Transcribing so mouse-started runs don't type into VOXD itself.
+- **Cyrillic fix** — non-ASCII text is pasted via clipboard instead of being silently dropped to punctuation by `ydotool type`.
+- **Dark theme for all dialogs** — Settings / Language / Models / AIPP-prompts / Config editor / Flux tuner no longer render white-on-white.
+- **Terminal report** — GUI/tray/flux print the effective session (`lang | translate | typing_mode | model`) plus per-item `Transcript` / `Translated` / `Typing` / `Done` lines and queue events.
+- **`--lang` reaches GUI/tray** — session overrides propagate to the shared config singleton (via `VOXD_LANG` / `VOXD_TRANSLATE`), session-only, never written to disk.
   
 **Tested & Works on:**
 - Arch / Hyprland

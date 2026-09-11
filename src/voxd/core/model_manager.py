@@ -59,6 +59,8 @@ class ModelManager(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Manage Whisper Models")
+        from voxd.gui.theme import apply_dark_theme
+        apply_dark_theme(self)
         self.setMinimumWidth(600)
 
         layout = QVBoxLayout(self)

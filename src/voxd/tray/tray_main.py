@@ -12,7 +12,7 @@ from voxd.core.config import get_config
 from voxd.core.logger import SessionLogger
 from voxd.utils.ipc_server import start_ipc_server
 from voxd.core.voxd_core import (
-    CoreProcessThread,
+    DictationQueue,
     show_options_dialog,
     show_manage_prompts,
     session_log_dialog,
@@ -39,7 +39,10 @@ class VoxdTrayApp(QObject):
         self.logger = SessionLogger(self.cfg.log_enabled, self.cfg.log_location)
         self.status = "VOXD"
         self.last_transcript = ""
-        self.thread = None
+        self.queue = DictationQueue(self.cfg, self.logger)
+        self.queue.status_changed.connect(self.set_status, Qt.ConnectionType.QueuedConnection)
+        self.queue.item_finished.connect(self.on_transcript_ready)
+        self.queue.queue_drained.connect(self.on_queue_drained)
 
         # ── Icon creation (needs QApplication to exist) ───────────────────
         self.icon_idle = QIcon(str(ASSETS_DIR / _IDLE_NAME))
@@ -112,37 +115,35 @@ class VoxdTrayApp(QObject):
         self.status = text
         self.tray.setToolTip(f"VOXD - {text}")
         # ── Animation handling based on status ─────────────────────────────
-        if text == "Recording":
+        if text.startswith("Recording"):
             self._start_animation(self.icons_recording, total_period_ms=500)
-        elif text in ("Transcribing", "Typing"):
+        elif text.startswith(("Transcribing", "Typing")):
             self._start_animation(self.icons_transcribing, total_period_ms=1000)
         else:  # idle or unknown → stop anim
             self._stop_animation()
-        self.record_action.setText(
-            "Start Recording" if text == "VOXD" else ("Stop Recording" if text == "Recording" else f"{text}...")
-        )
+        if text == "VOXD":
+            self.record_action.setText("Start Recording")
+        elif text.startswith("Recording"):
+            self.record_action.setText("Stop Recording")
+        else:
+            self.record_action.setText(f"{text}...")
         self.refresh_tray_menu()
         QApplication.processEvents()
 
     def toggle_recording(self):
-        if self.status == "Recording":
-            if self.thread and self.thread.isRunning():
-                self.thread.stop_recording()
-            return
-        if self.status in ("Transcribing", "Typing"):
-            return
-        self.set_status("Recording")
-        self.thread = CoreProcessThread(self.cfg, self.logger)
-        self.thread.status_changed.connect(self.set_status, Qt.ConnectionType.QueuedConnection)
-        self.thread.finished.connect(self.on_transcript_ready)
-        self.thread.start()
+        # The queue accepts a new recording at any time: while an item is
+        # transcribing/typing the finished recording waits its turn in FIFO.
+        self.queue.toggle()
 
     def on_transcript_ready(self, tscript):
         if tscript:
             self.last_transcript = tscript
             # Optionally, show a notification here
-            # ── Prompt for accuracy rating (GUI thread safe) -------------
-            if self.cfg.perf_collect and self.cfg.perf_accuracy_rating_collect:
+
+    def on_queue_drained(self):
+        # ── Prompt for accuracy rating (GUI thread safe) -------------
+        if self.cfg.perf_collect and self.cfg.perf_accuracy_rating_collect:
+            if self.last_transcript:
                 from PyQt6.QtWidgets import QInputDialog
                 s, ok = QInputDialog.getText(
                     None,

@@ -1,3 +1,4 @@
+import re
 import sys
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout, 
@@ -11,7 +12,7 @@ from voxd.core.config import get_config, CONFIG_PATH
 from voxd.core.logger import SessionLogger
 from voxd.utils.ipc_server import start_ipc_server
 from voxd.core.voxd_core import (
-    CoreProcessThread, _create_styled_checkbox,
+    DictationQueue, _create_styled_checkbox,
     show_manage_prompts, session_log_dialog, show_performance_dialog
 )
 from voxd.core.model_manager import show_model_manager
@@ -19,6 +20,8 @@ from voxd.gui.settings_dialog import SettingsDialog
 from voxd.utils.performance import update_last_perf_entry
 
 ASSETS_DIR = (Path(__file__).resolve().parent / ".." / "assets").resolve()
+
+_QUEUE_DEPTH_RE = re.compile(r"\(\+(\d+) queued\)")
 
 # Design constants
 UI_GRAY_COLOR = "#3a3a3a"  # Primary gray color for UI elements
@@ -35,7 +38,7 @@ class VoxdApp(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self.setWindowTitle("voxd")
-        self.setFixedSize(340, 162)  # Adjusted for spacing after drag bar
+        self.setFixedSize(340, 180)  # Room for the queue indicator row
         self.setStyleSheet("""
             QWidget {
                 color: white;
@@ -185,6 +188,12 @@ class VoxdApp(QWidget):
         self.clipboard_notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.clipboard_notice.setFixedHeight(10)
 
+        self.queue_label = QLabel("")
+        self.queue_label.setStyleSheet("color: #FFA940; font-size: 8pt; font-weight: bold;")
+        self.queue_label.setWordWrap(True)
+        self.queue_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.queue_label.setFixedHeight(14)
+
         # Options button with dropdown menu
         self.options_btn = QPushButton("Options")
         self.options_btn.setFixedSize(96, 32)  # 80% of main button width, 20% reduced height
@@ -204,8 +213,11 @@ class VoxdApp(QWidget):
         self.options_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.options_btn.clicked.connect(self.show_options_menu)
 
-        # Placeholder for background processing thread
-        self.runner_thread = None
+        # Serial dictation queue (record any time, transcribe/type in order)
+        self.queue = DictationQueue(self.cfg, self.logger)
+        self.queue.status_changed.connect(self.set_status)
+        self.queue.item_finished.connect(self.on_transcript_ready)
+        self.queue.queue_drained.connect(self.on_queue_drained)
 
         # Animation timer for status button
         self._anim_timer = QTimer(self)
@@ -356,7 +368,10 @@ class VoxdApp(QWidget):
         
         # Clipboard notice
         col2.addWidget(self.clipboard_notice)
-        
+
+        # Queue depth indicator (visible while items wait their turn)
+        col2.addWidget(self.queue_label)
+
         row3.addLayout(col2, 1)  # 1 = stretch to fill remaining space
         
         main_layout.addLayout(row3)
@@ -495,25 +510,29 @@ Create a global <b>HOTKEY</b> shortcut in your system (e.g. <b>Super+Z</b>) that
     def set_status(self, text):
         self.status = text
         self.status_button.setText(text)
-        if text == "Recording":
+        if text.startswith("Recording"):
             self._start_button_anim("recording")
-        elif text in ("Transcribing", "Typing"):
+        elif text.startswith(("Transcribing", "Typing")):
             self._start_button_anim("processing")
         else:
             self._stop_button_anim()
             self.status_button.setStyleSheet(self._idle_btn_style)
+        m = _QUEUE_DEPTH_RE.search(text)
+        self.queue_label.setText(f"Queued: {m.group(1)}" if m else "")
         QApplication.processEvents()
         try:
             self.tray.setToolTip(f"VOXD - {text}")
-            if text == "Recording":
+            if text.startswith("Recording"):
                 self._tray_start_animation(self.icons_recording, total_period_ms=500)
-            elif text in ("Transcribing", "Typing"):
+            elif text.startswith(("Transcribing", "Typing")):
                 self._tray_start_animation(self.icons_transcribing, total_period_ms=1000)
             else:
                 self._tray_stop_animation()
         except Exception:
             pass
-        if text == "Typing":
+        if text.startswith(("Transcribing", "Typing")):
+            # Get out of the way well before keystrokes start: otherwise a
+            # mouse-started run types into our own window instead of the app.
             self.setWindowState(self.windowState() | Qt.WindowState.WindowMinimized)
 
     def _start_button_anim(self, mode: str):
@@ -599,19 +618,12 @@ Create a global <b>HOTKEY</b> shortcut in your system (e.g. <b>Super+Z</b>) that
             pass
 
     def on_button_clicked(self):
-        if self.status == "Recording":
-            if self.runner_thread and self.runner_thread.isRunning():
-                self.runner_thread.stop_recording()
-            return
+        # The queue accepts a new recording at any time: while an item is
+        # transcribing/typing the finished recording waits its turn in FIFO.
         self.clearFocus()
-        if self.status in ("Transcribing", "Typing"):
-            return
-        self.set_status("Recording")
-        self.clipboard_notice.setText("")
-        self.runner_thread = CoreProcessThread(self.cfg, self.logger)
-        self.runner_thread.status_changed.connect(self.set_status)
-        self.runner_thread.finished.connect(self.on_transcript_ready)
-        self.runner_thread.start()
+        self.queue.toggle()
+        if self.queue.is_recording():
+            self.clipboard_notice.setText("")
 
     def on_transcript_ready(self, tscript):
         if tscript:
@@ -619,9 +631,12 @@ Create a global <b>HOTKEY</b> shortcut in your system (e.g. <b>Super+Z</b>) that
             short = tscript[:80] + (" …" if len(tscript) > 80 else "")
             self.transcript_label.setText(short)
             self.transcript_label.setStyleSheet("color: white; font-size: 10pt; font-style: italic;")
-            
+
             self.clipboard_notice.setText("Copied to clipboard")
-            if getattr(self.cfg, "perf_collect", False) and getattr(self.cfg, "perf_accuracy_rating_collect", False):
+
+    def on_queue_drained(self):
+        if getattr(self.cfg, "perf_collect", False) and getattr(self.cfg, "perf_accuracy_rating_collect", False):
+            if self.last_transcript:
                 s, ok = QInputDialog.getText(
                     self,
                     "Accuracy Rating",
