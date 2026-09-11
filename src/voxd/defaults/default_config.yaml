@@ -3,6 +3,7 @@ log_location: ''
 perf_collect: false
 perf_accuracy_rating_collect: true
 typing: true
+typing_mode: auto  # auto: keystroke-type Latin, paste the rest; type: always keystrokes; paste: always clipboard
 typing_delay: 1
 typing_start_delay: 0.15
 ctrl_v_paste: false  # Use Ctrl+V instead of default Ctrl+Shift+V
@@ -23,6 +24,7 @@ mic_autoset_level: 0.45
 whisper_binary: whisper.cpp/build/bin/whisper-cli
 whisper_model_path: whisper.cpp/models/ggml-base.en.bin
 language: en
+translate_target: ''  # empty = off; ISO 639-1 = type everything translated into it (e.g. ru)
 
 # --- Flux (VAD-driven continuous dictation) ---------------------------------
 flux_min_silence_ms: 500     # pause to finalize an utterance

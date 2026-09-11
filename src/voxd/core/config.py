@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     "log_enabled": True,
     "log_location": "",
     "typing": True,
+    "typing_mode": "auto",  # auto: keystroke-type Latin, paste the rest; type: always keystrokes; paste: always clipboard
     "typing_delay": 1,
     "typing_start_delay": 0.15,
     "ctrl_v_paste": False,  # Use Ctrl+V instead of default Ctrl+Shift+V
@@ -40,6 +41,7 @@ DEFAULT_CONFIG = {
     "whisper_binary": "whisper.cpp/build/bin/whisper-cli",
     "whisper_model_path": "whisper.cpp/models/ggml-base.en.bin",
     "language": "en",
+    "translate_target": "",  # empty = off; ISO 639-1 code = type everything translated into it
 
     # --- Flux (VAD-driven continuous dictation) ------------------------------
     # Defaults are conservative and CPU-light; Flux VAD is built-in
@@ -128,9 +130,23 @@ if not CONFIG_PATH.exists():
 class AppConfig:
     def __init__(self):
         self.data = DEFAULT_CONFIG.copy()
+        # Session-only overrides (VOXD_* env): original disk values kept here
+        # so save() never persists them.
+        self._session_overrides: dict = {}
         self.load()
         self._validate_aipp_config()
         self.update_available_llamacpp_models()
+
+    def _apply_session(self, key: str, value):
+        """Apply a session-only override (or restore the disk value when
+        *value* is None because the env var went away)."""
+        if value is None:
+            if key in self._session_overrides:
+                self.data[key] = self._session_overrides.pop(key)
+            return
+        if key not in self._session_overrides:
+            self._session_overrides[key] = self.data.get(key)
+        self.data[key] = value
 
     def load(self):
         if CONFIG_PATH.exists():
@@ -195,19 +211,88 @@ class AppConfig:
             self.data["language"] = "en"
             updated = True
 
+        # Normalize typing_mode
+        try:
+            mode = str(self.data.get("typing_mode", "auto")).strip().lower()
+            if mode not in ("auto", "type", "paste"):
+                print(f"[config] Invalid typing_mode '{self.data.get('typing_mode')}', falling back to 'auto'")
+                mode = "auto"
+            if self.data.get("typing_mode") != mode:
+                self.data["typing_mode"] = mode
+                updated = True
+        except Exception:
+            self.data["typing_mode"] = "auto"
+            updated = True
+
+        # Normalize translate_target (empty = off)
+        try:
+            target = normalize_lang_code(self.data.get("translate_target", ""))
+            if target and not is_valid_lang(target):
+                print(f"[config] Invalid translate_target '{self.data.get('translate_target')}', disabling translation")
+                target = ""
+            if self.data.get("translate_target") != target:
+                self.data["translate_target"] = target
+                updated = True
+        except Exception:
+            self.data["translate_target"] = ""
+            updated = True
+
+        # Save config if any path was updated
+        if updated:
+            self.save()
+
+        # Session-only overrides from CLI flags (never persisted – see save()).
+        # This is also what makes top-level flags like --lang/--translate
+        # reach GUI & tray, which run on the shared get_config() singleton.
+        if not hasattr(self, "_session_overrides") or self._session_overrides is None:
+            self._session_overrides = {}
+        if os.environ.get("VOXD_LANG"):
+            try:
+                code = normalize_lang_code(os.environ["VOXD_LANG"])
+                if is_valid_lang(code):
+                    self._apply_session("language", code)
+            except Exception:
+                pass
+        else:
+            self._apply_session("language", None)
+        if "VOXD_TRANSLATE" in os.environ:
+            try:
+                target = normalize_lang_code(os.environ["VOXD_TRANSLATE"])
+                if target and is_valid_lang(target):
+                    self._apply_session("translate_target", target)
+                elif not target:
+                    self._apply_session("translate_target", "")
+            except Exception:
+                pass
+        else:
+            self._apply_session("translate_target", None)
+
         # Assign config values to attributes
         for k, v in self.data.items():
             setattr(self, k, v)
 
         self.log_location = self.data.get("log_location", "")
 
-        # Save config if any path was updated
-        if updated:
-            self.save()
-
     def save(self):
-        with open(CONFIG_PATH, "w") as f:
-            yaml.dump(self.data, f, default_flow_style=False)
+        overrides = getattr(self, "_session_overrides", None) or {}
+        if not overrides:
+            with open(CONFIG_PATH, "w") as f:
+                yaml.dump(self.data, f, default_flow_style=False)
+            return
+        # Temporarily restore disk values so session overrides never persist.
+        live = {k: self.data.get(k) for k in overrides}
+        try:
+            for k, v in overrides.items():
+                self.data[k] = v
+            with open(CONFIG_PATH, "w") as f:
+                yaml.dump(self.data, f, default_flow_style=False)
+        finally:
+            self.data.update(live)
+            for k, v in live.items():
+                try:
+                    setattr(self, k, v)
+                except Exception:
+                    pass
         # print("\n[config] Configuration saved.")
 
     def set(self, key, value):
@@ -237,6 +322,9 @@ class AppConfig:
         if not isinstance(self.typing_delay, (int, float)) or not (0 <= self.typing_delay <= 1):
             print(f"  ⚠️ Typing delay out of range: {self.typing_delay} (allowed 0–1)")
 
+        if self.data.get("typing_mode") not in ("auto", "type", "paste"):
+            print(f"  ⚠️ Invalid typing_mode: {self.data.get('typing_mode')} (allowed auto/type/paste)")
+
         if not isinstance(self.typing_start_delay, (int, float)) or not (0.0 <= self.typing_start_delay <= 5):
             # Using .data avoids mypy complaints about dynamic attrs
             val = self.data.get("typing_start_delay", 0.15)
@@ -257,6 +345,16 @@ class AppConfig:
                 print("  ⚠️ llama-server not found but llamacpp_server provider selected")
             if not status["default_model_available"]:
                 print("  ⚠️ Default llama.cpp model not found")
+
+        target = self.data.get("translate_target", "")
+        if target and not is_valid_lang(target):
+            print(f"  ⚠️ Invalid translate_target: {target}")
+        elif target:
+            from voxd.core.transcriber import model_is_english_only
+            if target != "en" and model_is_english_only(str(self.data.get("whisper_model_path", ""))):
+                print("  ℹ️ translate_target is set but transcription uses an English-only (*.en) model – source speech must be English.")
+            if target == "en" and model_is_english_only(str(self.data.get("whisper_model_path", ""))):
+                print("  ⚠️ translate_target 'en' needs a multilingual model for speech translation (whisper --translate); with a *.en model only English speech is transcribed.")
 
         # Warn if non-English language is set but an English-only (*.en) model is configured
         try:

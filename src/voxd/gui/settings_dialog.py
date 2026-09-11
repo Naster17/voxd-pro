@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from voxd.core.config import AppConfig
+from voxd.gui.theme import apply_dark_theme
 
 
 class SettingsDialog(QDialog):
@@ -43,6 +44,7 @@ class SettingsDialog(QDialog):
     def __init__(self, cfg: AppConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
+        apply_dark_theme(self)
         self.cfg = cfg
         # Let the dialog size adapt naturally to its contents;
         # scroll-area will provide overflow protection.
@@ -74,6 +76,8 @@ class SettingsDialog(QDialog):
         form.addRow(self._section_label("General"), QLabel(""))
 
         self._add_checkbox(form, "typing", "Enable typing")
+        self._add_combo(form, "typing_mode", "Typing mode", ["auto", "type", "paste"])
+        self._add_text(form, "translate_target", "Translate to (empty = off, e.g. ru)")
         self._add_spin(form, "typing_delay", "Typing delay (ms)", 0, 1000)
         self._add_doublespin(form, "typing_start_delay", "Start delay (s)", 0, 5, step=0.05)
         self._add_checkbox(form, "ctrl_v_paste", "Use Ctrl+V paste")
@@ -202,6 +206,25 @@ class SettingsDialog(QDialog):
         form.addRow(label, btn)
         self._widgets[key] = btn
         return btn
+
+    def _add_combo(self, form: QFormLayout, key: str, label: str, items: list) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(items)
+        current = str(self.cfg.data.get(key, items[0]))
+        idx = combo.findText(current)
+        combo.setCurrentIndex(max(0, idx))
+        form.addRow(label, combo)
+        self._widgets[key] = combo
+        return combo
+
+    def _add_text(self, form: QFormLayout, key: str, label: str, placeholder: str = "") -> QLineEdit:
+        edit = QLineEdit()
+        edit.setText(str(self.cfg.data.get(key, "")))
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        form.addRow(label, edit)
+        self._widgets[key] = edit
+        return edit
 
     def _add_spin(self, form: QFormLayout, key: str, label: str, mn: int, mx: int) -> QSpinBox:
         sb = QSpinBox()

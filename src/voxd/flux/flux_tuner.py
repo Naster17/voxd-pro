@@ -40,8 +40,9 @@ class TunerState:
 class FluxTunerWindow(QtWidgets.QWidget):
     def __init__(self, cfg: AppConfig):
         super().__init__()
-        self.cfg = cfg
         self.setWindowTitle("VOXD Flux Tuner")
+        from voxd.gui.theme import apply_dark_theme
+        apply_dark_theme(self)
         self.resize(900, 520)
 
         if pg is None:

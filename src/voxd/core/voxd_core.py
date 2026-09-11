@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
-from PyQt6.QtCore import QThread, pyqtSignal, Qt  # type: ignore
+import queue as _queue_mod
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt  # type: ignore
 from PyQt6.QtWidgets import (  # type: ignore
     QDialog, QVBoxLayout, QPushButton, QFileDialog, QMessageBox,
     QGroupBox, QHBoxLayout, QCheckBox, QComboBox, QLineEdit, QLabel,
@@ -7,19 +8,170 @@ from PyQt6.QtWidgets import (  # type: ignore
     QWidget
 )
 import yaml
-from voxd.core.aipp import get_final_text
+from voxd.core.aipp import get_final_text, get_translated_text
+from voxd.gui.theme import apply_dark_theme
 from voxd.core.model_manager import show_model_manager
 from voxd.core.transcriber import WhisperTranscriber  # type: ignore
 from voxd.utils.languages import search_languages, code_to_name, normalize_lang_code, is_valid_lang
 
-class CoreProcessThread(QThread):
-    finished = pyqtSignal(str)
-    status_changed = pyqtSignal(str)
-    
-    def __init__(self, cfg, logger):
+def _with_depth(base: str, depth: int) -> str:
+    """Append a queue-depth suffix to a status string when jobs are waiting."""
+    return f"{base} (+{depth} queued)" if depth > 0 else base
+
+
+def _process_audio_file(cfg, logger, rec_path, rec_start_dt, rec_end_dt, on_status=None):
+    """Transcribe → AIPP → clipboard → type for one recorded file.
+
+    Returns the final text ("" when there is nothing to type).
+    """
+    from voxd.core.typer import SimulatedTyper
+    from voxd.core.clipboard import ClipboardManager
+    from time import time
+    from datetime import datetime
+    import psutil
+
+    def _emit(status: str):
+        try:
+            if on_status is not None:
+                on_status(status)
+        except Exception:
+            pass
+
+    # Ensure whisper-cli exists – attempt auto-build when missing
+    from voxd.utils.whisper_auto import ensure_whisper_cli  # local import to avoid GUI deps in headless tests
+    from voxd.core.transcriber import translation_source, translation_target, use_native_translate
+
+    try:
+        transcriber = WhisperTranscriber(
+            model_path=cfg.whisper_model_path,
+            binary_path=cfg.whisper_binary,
+            language=translation_source(cfg),
+            translate=use_native_translate(cfg),
+        )
+    except FileNotFoundError:
+        # Try to build on the fly (GUI prompt)
+        if ensure_whisper_cli("gui") is None:
+            # User declined or build failed – abort gracefully
+            return ""
+        transcriber = WhisperTranscriber(
+            model_path=cfg.whisper_model_path,
+            binary_path=cfg.whisper_binary,
+            language=translation_source(cfg),
+            translate=use_native_translate(cfg),
+        )
+    typer = SimulatedTyper(delay=cfg.typing_delay, start_delay=cfg.typing_start_delay, cfg=cfg)
+    clipboard = ClipboardManager()
+
+    # ── Transcription ----------------------------------------------
+    _emit("Transcribing")
+    trans_start_ts = time()
+    tscript, _ = transcriber.transcribe(rec_path)
+    trans_end_ts = time()
+    if not tscript:
+        print("[voxd] Empty transcript, nothing to type.")
+        return ""
+
+    print(f"[voxd] Transcript ({trans_end_ts - trans_start_ts:.1f}s, lang={transcriber.language}): {tscript}")
+
+    # --- Translate into the forced output language (if set) ---
+    # Target "en" is already translated natively by whisper; other targets
+    # go through the LLM provider. AIPP below then polishes the result.
+    translated = get_translated_text(tscript, cfg)
+    if translated and translated != tscript:
+        try:
+            logger.log_entry(f"[translated] {translated}")
+        except Exception:
+            pass
+        print(f"[voxd] Translated ({translation_target(cfg)}): {translated}")
+        tscript = translated
+
+    # --- Apply AIPP if enabled ---
+    aipp_start_ts = aipp_end_ts = None
+    final_text = get_final_text(tscript, cfg)
+    if cfg.aipp_enabled and final_text and final_text != tscript:
+        aipp_start_ts = time()
+        # get_final_text already ran; so timing is approximated. We skip precise.
+        aipp_end_ts = aipp_start_ts  # zero duration placeholder due to prior exec
+        print(f"[voxd] AIPP: {final_text}")
+
+    # === Logging ------------------------------------------------------
+    try:
+        if cfg.aipp_enabled:
+            # Log both original and, if different, AIPP output
+            logger.log_entry(f"[original] {tscript}")
+            if final_text and final_text != tscript:
+                logger.log_entry(f"[aipp] {final_text}")
+        else:
+            # AIPP disabled → keep legacy single-line behaviour
+            logger.log_entry(tscript)
+    except Exception:
+        pass  # logging failures should never crash the thread
+
+    # Copy to clipboard unless typing is enabled with paste mode (delay <= 0)
+    # to avoid double-copying to clipboard
+    typing_will_paste = (cfg.typing and
+                       cfg.typing_delay <= 0)
+
+    if not typing_will_paste and final_text:
+        clipboard.copy(final_text)
+
+    if cfg.typing and final_text:
+        _emit("Typing")
+        try:
+            mode = typer._typing_mode()
+        except Exception:
+            mode = "auto"
+        print(f"[voxd] Typing (mode={mode}, {len(final_text)} chars)...")
+        try:
+            typer.type(final_text)
+            print("[voxd] Done.")
+        except Exception as e:
+            print(f"[core] Typing failed: {e}")
+
+    # ── Accuracy rating (GUI prompt handled in main thread) ---------
+    usr_trans_acc = None  # Will be updated by the GUI after the run
+
+    # ── Performance logging ---------------------------------------
+    if cfg.perf_collect:
+        from pathlib import Path as _P
+        from voxd.utils.performance import write_perf_entry
+
+        perf_entry = {
+            "date": rec_start_dt.strftime("%Y-%m-%d"),
+            "rec_start_time": rec_start_dt.strftime("%H:%M:%S"),
+            "rec_end_time": rec_end_dt.strftime("%H:%M:%S"),
+            "rec_dur": (rec_end_dt - rec_start_dt).total_seconds(),
+            "trans_start_time": datetime.fromtimestamp(trans_start_ts).strftime("%H:%M:%S"),
+            "trans_end_time": datetime.fromtimestamp(trans_end_ts).strftime("%H:%M:%S"),
+            "trans_dur": trans_end_ts - trans_start_ts,
+            "trans_eff": (trans_end_ts - trans_start_ts) / max(len(tscript), 1),
+            "transcript": tscript,
+            "usr_trans_acc": usr_trans_acc,
+            "trans_model": _P(cfg.whisper_model_path).name,
+            "aipp_start_time": datetime.fromtimestamp(aipp_start_ts).strftime("%H:%M:%S") if aipp_start_ts else None,
+            "aipp_end_time": datetime.fromtimestamp(aipp_end_ts).strftime("%H:%M:%S") if aipp_end_ts else None,
+            "aipp_dur": (aipp_end_ts - aipp_start_ts) if aipp_start_ts and aipp_end_ts else None,
+            "ai_model": cfg.aipp_model if cfg.aipp_enabled else None,
+            "ai_provider": cfg.aipp_provider if cfg.aipp_enabled else None,
+            "ai_prompt": cfg.aipp_active_prompt if cfg.aipp_enabled else None,
+            "ai_transcript": final_text if cfg.aipp_enabled else None,
+            "aipp_eff": ((aipp_end_ts - aipp_start_ts) / max(len(final_text), 1)) if cfg.aipp_enabled and aipp_start_ts and aipp_end_ts and final_text else None,
+            "sys_mem": psutil.virtual_memory().total,
+            "sys_cpu": psutil.cpu_freq().max,
+            "total_dur": (trans_end_ts - trans_start_ts) + (rec_end_dt - rec_start_dt).total_seconds()
+        }
+        write_perf_entry(perf_entry)
+
+    return final_text or ""
+
+
+class RecordThread(QThread):
+    """Records microphone audio until stopped, then emits the saved file."""
+
+    recorded = pyqtSignal(object)  # dict(path, rec_start, rec_end) or None
+
+    def __init__(self):
         super().__init__()
-        self.cfg = cfg
-        self.logger = logger
         self.should_stop = False
 
     def stop_recording(self):
@@ -27,128 +179,155 @@ class CoreProcessThread(QThread):
 
     def run(self):
         from voxd.core.recorder import AudioRecorder
-        from voxd.core.typer import SimulatedTyper
-        from voxd.core.clipboard import ClipboardManager
-        from time import time
         from datetime import datetime
-        import psutil
 
         recorder = AudioRecorder()
-
-        # Ensure whisper-cli exists – attempt auto-build when missing
-        from voxd.utils.whisper_auto import ensure_whisper_cli  # local import to avoid GUI deps in headless tests
-
-        try:
-            transcriber = WhisperTranscriber(
-                model_path=self.cfg.whisper_model_path,
-                binary_path=self.cfg.whisper_binary,
-                language=getattr(self.cfg, "language", "en"),
-            )
-        except FileNotFoundError:
-            # Try to build on the fly (GUI prompt)
-            if ensure_whisper_cli("gui") is None:
-                # User declined or build failed – abort gracefully
-                self.status_changed.emit("VOXD")
-                self.finished.emit("")
-                return
-            transcriber = WhisperTranscriber(
-                model_path=self.cfg.whisper_model_path,
-                binary_path=self.cfg.whisper_binary,
-                language=getattr(self.cfg, "language", "en"),
-            )
-        typer = SimulatedTyper(delay=self.cfg.typing_delay, start_delay=self.cfg.typing_start_delay, cfg=self.cfg)
-        clipboard = ClipboardManager()
-
-        # ── Recording ---------------------------------------------------
         rec_start_dt = datetime.now()
         recorder.start_recording()
         while not self.should_stop:
             self.msleep(100)
         rec_end_dt = datetime.now()
-
-        self.status_changed.emit("Transcribing")
         rec_path = recorder.stop_recording(preserve=False)
+        if rec_path is None:
+            self.recorded.emit(None)
+        else:
+            self.recorded.emit({"path": str(rec_path), "rec_start": rec_start_dt, "rec_end": rec_end_dt})
 
-        # ── Transcription ----------------------------------------------
-        trans_start_ts = time()
-        tscript, _ = transcriber.transcribe(rec_path)
-        trans_end_ts = time()
-        if not tscript:
-            self.finished.emit("")
-            return
 
-        # --- Apply AIPP if enabled ---
-        aipp_start_ts = aipp_end_ts = None
-        final_text = get_final_text(tscript, self.cfg)
-        if self.cfg.aipp_enabled and final_text and final_text != tscript:
-            aipp_start_ts = time()
-            # get_final_text already ran; so timing is approximated. We skip precise.
-            aipp_end_ts = aipp_start_ts  # zero duration placeholder due to prior exec
+class QueueWorkerThread(QThread):
+    """Processes queued audio files strictly in FIFO order."""
 
-        # === Logging ------------------------------------------------------
-        try:
-            if self.cfg.aipp_enabled:
-                # Log both original and, if different, AIPP output
-                self.logger.log_entry(f"[original] {tscript}")
-                if final_text and final_text != tscript:
-                    self.logger.log_entry(f"[aipp] {final_text}")
-            else:
-                # AIPP disabled → keep legacy single-line behaviour
-                self.logger.log_entry(tscript)
-        except Exception:
-            pass  # logging failures should never crash the thread
+    status_changed = pyqtSignal(str)
+    item_finished = pyqtSignal(str)
+    drained = pyqtSignal()
 
-        # Copy to clipboard unless typing is enabled with paste mode (delay <= 0)
-        # to avoid double-copying to clipboard
-        typing_will_paste = (self.cfg.typing and 
-                           self.cfg.typing_delay <= 0)
-        
-        if not typing_will_paste and final_text:
-            clipboard.copy(final_text)
+    def __init__(self, cfg, logger, jobs):
+        super().__init__()
+        self.cfg = cfg
+        self.logger = logger
+        self.jobs = jobs
 
-        if self.cfg.typing and final_text:
-            self.status_changed.emit("Typing")
+    def run(self):
+        while True:
             try:
-                typer.type(final_text)
+                job = self.jobs.get_nowait()
+            except _queue_mod.Empty:
+                break
+            depth = self.jobs.qsize()
+            self.status_changed.emit(_with_depth("Transcribing", depth))
+            try:
+                final_text = _process_audio_file(
+                    self.cfg,
+                    self.logger,
+                    job["path"],
+                    job["rec_start"],
+                    job["rec_end"],
+                    on_status=lambda s: self.status_changed.emit(_with_depth(s, self.jobs.qsize())),
+                )
             except Exception as e:
-                print(f"[core] Typing failed: {e}")
-            print()
+                print(f"[core] Queued item failed: {e}")
+                final_text = ""
+            self.item_finished.emit(final_text or "")
+        self.drained.emit()
 
-        # ── Accuracy rating (GUI prompt handled in main thread) ---------
-        usr_trans_acc = None  # Will be updated by the GUI after the run
 
-        # ── Performance logging ---------------------------------------
-        if self.cfg.perf_collect:
-            from pathlib import Path as _P
-            from voxd.utils.performance import write_perf_entry
+class DictationQueue(QObject):
+    """Serial dictation queue: record any time, transcribe/type in order.
 
-            perf_entry = {
-                "date": rec_start_dt.strftime("%Y-%m-%d"),
-                "rec_start_time": rec_start_dt.strftime("%H:%M:%S"),
-                "rec_end_time": rec_end_dt.strftime("%H:%M:%S"),
-                "rec_dur": (rec_end_dt - rec_start_dt).total_seconds(),
-                "trans_start_time": datetime.fromtimestamp(trans_start_ts).strftime("%H:%M:%S"),
-                "trans_end_time": datetime.fromtimestamp(trans_end_ts).strftime("%H:%M:%S"),
-                "trans_dur": trans_end_ts - trans_start_ts,
-                "trans_eff": (trans_end_ts - trans_start_ts) / max(len(tscript), 1),
-                "transcript": tscript,
-                "usr_trans_acc": usr_trans_acc,
-                "trans_model": _P(self.cfg.whisper_model_path).name,
-                "aipp_start_time": datetime.fromtimestamp(aipp_start_ts).strftime("%H:%M:%S") if aipp_start_ts else None,
-                "aipp_end_time": datetime.fromtimestamp(aipp_end_ts).strftime("%H:%M:%S") if aipp_end_ts else None,
-                "aipp_dur": (aipp_end_ts - aipp_start_ts) if aipp_start_ts and aipp_end_ts else None,
-                "ai_model": self.cfg.aipp_model if self.cfg.aipp_enabled else None,
-                "ai_provider": self.cfg.aipp_provider if self.cfg.aipp_enabled else None,
-                "ai_prompt": self.cfg.aipp_active_prompt if self.cfg.aipp_enabled else None,
-                "ai_transcript": final_text if self.cfg.aipp_enabled else None,
-                "aipp_eff": ((aipp_end_ts - aipp_start_ts) / max(len(final_text), 1)) if self.cfg.aipp_enabled and aipp_start_ts and aipp_end_ts and final_text else None,
-                "sys_mem": psutil.virtual_memory().total,
-                "sys_cpu": psutil.cpu_freq().max,
-                "total_dur": (trans_end_ts - trans_start_ts) + (rec_end_dt - rec_start_dt).total_seconds()
-            }
-            write_perf_entry(perf_entry)
+    Hotkey behaviour: pressing the hotkey while an item is transcribing or
+    typing starts a new recording immediately; the finished recording is
+    appended to the FIFO and processed when earlier items are done.
+    """
 
-        self.finished.emit(final_text)
+    status_changed = pyqtSignal(str)
+    item_finished = pyqtSignal(str)
+    queue_drained = pyqtSignal()
+
+    def __init__(self, cfg, logger):
+        super().__init__()
+        self.cfg = cfg
+        self.logger = logger
+        self.jobs = _queue_mod.Queue()
+        self.recorder = None
+        self.worker = None
+        self._phase = "Ready"
+        self._counter = 0
+        self._had_backlog = False
+
+    def is_recording(self):
+        return self.recorder is not None and self.recorder.isRunning()
+
+    def toggle(self):
+        """Start a recording, or stop the running one (it joins the queue)."""
+        if self.is_recording():
+            self.recorder.stop_recording()
+            return
+        self.recorder = RecordThread()
+        self.recorder.recorded.connect(self._on_recorded)
+        self.recorder.start()
+        self._phase = "Recording"
+        print("[voxd] Recording... (hotkey again to stop)")
+        self.status_changed.emit(_with_depth("Recording", self.jobs.qsize()))
+
+    def _stage_job(self, path):
+        """Move a finished recording to a unique queue file so the shared
+        recorder temp file can be reused by the next recording."""
+        try:
+            from pathlib import Path
+            from datetime import datetime
+            p = Path(path)
+            self._counter += 1
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = p.parent / f"queued_{ts}_{self._counter:03d}.wav"
+            p.rename(dest)
+            return str(dest)
+        except Exception:
+            return str(path)
+
+    def _on_recorded(self, job):
+        self.recorder = None
+        if job is not None:
+            staged = self._stage_job(job["path"])
+            self.jobs.put({"path": staged, "rec_start": job["rec_start"], "rec_end": job["rec_end"]})
+            if self.worker is not None:
+                self._had_backlog = True
+                print(f"[voxd] Queued ({self.jobs.qsize()} waiting)...")
+        self._pump()
+        if self.worker is None:
+            if self.is_recording():
+                self._phase = "Recording"
+                self.status_changed.emit(_with_depth("Recording", self.jobs.qsize()))
+            else:
+                self.queue_drained.emit()
+
+    def _pump(self):
+        if self.worker is None and not self.jobs.empty():
+            self.worker = QueueWorkerThread(self.cfg, self.logger, self.jobs)
+            self.worker.status_changed.connect(self._on_worker_status)
+            self.worker.item_finished.connect(self._on_worker_item)
+            self.worker.drained.connect(self._on_worker_drained)
+            self.worker.start()
+
+    def _on_worker_status(self, text):
+        self._phase = text.split(" (+")[0]
+        self.status_changed.emit(text)
+
+    def _on_worker_item(self, text):
+        self.item_finished.emit(text)
+
+    def _on_worker_drained(self):
+        self.worker = None
+        # A recording may have finished while the last item drained.
+        self._pump()
+        if self.worker is None:
+            if self.is_recording():
+                self._phase = "Recording"
+                self.status_changed.emit(_with_depth("Recording", self.jobs.qsize()))
+            else:
+                if self._had_backlog:
+                    print("[voxd] Queue caught up.")
+                    self._had_backlog = False
+                self.queue_drained.emit()
 
 def show_options_dialog(parent, logger, cfg=None, modal=True, hide_aipp=False):
     if cfg is None:
@@ -257,6 +436,7 @@ def show_options_dialog(parent, logger, cfg=None, modal=True, hide_aipp=False):
 def show_config_editor(parent, config_path, after_save_cb=None):
     dlg = QDialog(parent)
     dlg.setWindowTitle("Edit Config")
+    apply_dark_theme(dlg)
     dlg.setMinimumSize(600, 400)
     layout = QVBoxLayout(dlg)
 
@@ -320,6 +500,7 @@ def show_manage_prompts(parent, cfg, after_save_cb=None, modal=True):
 
     dlg = QDialog(parent)
     dlg.setWindowTitle("Manage AIPP Prompts")
+    apply_dark_theme(dlg)
     dlg.setMinimumWidth(300)
 
     grid = QGridLayout(dlg)
@@ -409,7 +590,7 @@ def session_log_dialog(parent, logger):
     log_view = QDialog(parent)
     log_view.setWindowTitle("Session Log")
     log_view.setMinimumSize(600, 400)
-    log_view.setStyleSheet("background-color: #2e2e2e; color: white;")
+    apply_dark_theme(log_view)
 
     vbox = QVBoxLayout(log_view)
 
@@ -565,6 +746,7 @@ def show_performance_dialog(parent, cfg):
 def show_language_dialog(parent, cfg, modal=True):
     dlg = QDialog(parent)
     dlg.setWindowTitle("Language")
+    apply_dark_theme(dlg)
     dlg.setMinimumWidth(320)
     layout = QVBoxLayout(dlg)
 

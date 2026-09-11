@@ -164,6 +164,39 @@ def _parse_bool(s: str) -> bool:
         return False
     raise ValueError(f"expected true/false, got: {s}")
 
+#: Sentinel for a bare `--translate` (no LANG given).
+_TRANSLATE_USE_CONFIG = "__cfg__"
+
+
+def _resolve_translate_target(raw, cfg) -> str | None:
+    """Resolve a `--translate` value to a target language code.
+
+    * flag absent (None) → None (translation untouched)
+    * bare flag → configured translate_target, else the configured language
+    * LANG → validated code (must not be "auto")
+
+    Raises ValueError on invalid input.
+    """
+    from voxd.utils.languages import normalize_lang_code, is_valid_lang
+    if raw is None:
+        return None
+    if raw == _TRANSLATE_USE_CONFIG:
+        configured = normalize_lang_code(cfg.data.get("translate_target", "") or "")
+        if configured and is_valid_lang(configured) and configured != "auto":
+            return configured
+        fallback = normalize_lang_code(cfg.data.get("language", "") or "")
+        if fallback and is_valid_lang(fallback) and fallback != "auto":
+            return fallback
+        raise ValueError(
+            "No translation target: set a language first or pass --translate LANG (e.g. --translate ru)."
+        )
+    code = normalize_lang_code(raw)
+    if not code or not is_valid_lang(code) or code == "auto":
+        raise ValueError(
+            f"Invalid translation target '{raw}'. Expected ISO 639-1 (e.g. 'ru', 'en')."
+        )
+    return code
+
 def _systemd_user_available() -> bool:
     try:
         # Fast probe; returns 0 and prints version if systemd is available for user
@@ -352,6 +385,16 @@ def main():
         dest="lang",
         help="Transcription language (ISO 639-1, e.g. 'en', 'sv', or 'auto' for detection)"
     )
+    parser.add_argument(
+        "--translate",
+        nargs="?",
+        const=_TRANSLATE_USE_CONFIG,
+        default=None,
+        metavar="LANG",
+        help="Force output language: transcribe any speech, then type the translation "
+             "(ISO 639-1, e.g. --translate ru; bare flag uses the configured language; "
+             "target 'en' is translated natively by whisper, other targets via the AIPP LLM provider)"
+    )
     args, unknown = parser.parse_known_args()
 
     if args.version:
@@ -429,9 +472,27 @@ def main():
                 sys.exit(2)
             cfg.data["language"] = code
             setattr(cfg, "language", code)
+            # Reach GUI/tray/flux too: they run on the shared singleton.
+            os.environ["VOXD_LANG"] = code
         except Exception as e:
             print(f"[voxd] Failed to apply language override: {e}")
             sys.exit(2)
+    # Session-only forced output language
+    if args.translate is not None:
+        try:
+            target = _resolve_translate_target(args.translate, cfg)
+        except ValueError as e:
+            print(f"[voxd] {e}")
+            sys.exit(2)
+        if target:
+            cfg.data["translate_target"] = target
+            try:
+                setattr(cfg, "translate_target", target)
+            except Exception:
+                pass
+            os.environ["VOXD_TRANSLATE"] = target
+            from voxd.utils.languages import code_to_name
+            print(f"[voxd] Translation enabled: speech → {code_to_name(target)} ({target})")
     if args.gui:
         mode = "gui"
     elif args.tray:
@@ -521,6 +582,13 @@ def main():
 - advised: have VOXD always ready in the background, by enabling autostart: {ORANGE}`voxd --autostart true`{RESET}.
 - transcripts ALWAYS picked up into clipboard.
 """)
+
+    if mode in ("gui", "tray", "flux"):
+        from pathlib import Path as _P
+        _tr = cfg.data.get("translate_target") or "off"
+        print(f"[voxd] Session: lang={cfg.data.get('language')} | "
+              f"translate={_tr} | typing_mode={cfg.data.get('typing_mode')} | "
+              f"model={_P(str(cfg.data.get('whisper_model_path', ''))).name}")
 
     if mode == "cli":
         # Forward unknown args to cli_main

@@ -37,6 +37,36 @@ def edit_config(config_path="config.yaml"):
     from voxd.core.config import CONFIG_PATH
     subprocess.run(["xdg-open", str(CONFIG_PATH)])
 
+def _make_transcriber(cfg, delete_input=True):
+    """Transcriber honoring the forced output language (--translate)."""
+    from voxd.core.transcriber import translation_source, use_native_translate
+    return WhisperTranscriber(
+        cfg.whisper_model_path,
+        cfg.whisper_binary,
+        delete_input=delete_input,
+        language=translation_source(cfg),
+        translate=use_native_translate(cfg),
+    )
+
+def _translate_logged(tscript, cfg, logger):
+    """Translate into the forced output language, logging the pair.
+
+    Returns (text_to_use, was_translated). Never loses the dictation:
+    on any failure the original transcript is returned.
+    """
+    from voxd.core.aipp import get_translated_text
+    if not tscript:
+        return tscript, False
+    out = get_translated_text(tscript, cfg)
+    if out and out != tscript:
+        try:
+            logger.log_entry(f"[original] {tscript}")
+            logger.log_entry(f"[translated] {out}")
+        except Exception:
+            pass
+        return out, True
+    return tscript, False
+
 def _print_disk_space_status(target_dir: Path, threshold_mb: int = 500):
     usage = shutil.disk_usage(target_dir)
     free_mb = usage.free // (1024 * 1024)
@@ -77,12 +107,7 @@ def cli_main(cfg: AppConfig, logger: SessionLogger, args: argparse.Namespace):
                 chunk_seconds=int(getattr(cfg, "record_chunk_seconds", 300))
             )
             preserve = bool(args.save_audio) or bool(getattr(cfg, "save_recordings", False))
-            transcriber = WhisperTranscriber(
-                cfg.whisper_model_path,
-                cfg.whisper_binary,
-                delete_input=not preserve,
-                language=cfg.data.get("language", "en"),
-            )
+            transcriber = _make_transcriber(cfg, delete_input=not preserve)
             clipboard = ClipboardManager()
             typer = SimulatedTyper(delay=cfg.typing_delay, start_delay=cfg.typing_start_delay)
 
@@ -96,10 +121,12 @@ def cli_main(cfg: AppConfig, logger: SessionLogger, args: argparse.Namespace):
                 print("[core_runner] No transcript returned.")
                 continue
 
+            tscript, _was_translated = _translate_logged(tscript, cfg, logger)
             final_text = get_final_text(tscript, cfg)  # type: ignore[arg-type]
             clipboard.copy(final_text)
             if cfg.aipp_enabled:
-                logger.log_entry(f"[original] {tscript}")
+                if not _was_translated:
+                    logger.log_entry(f"[original] {tscript}")
                 if final_text != tscript:
                     logger.log_entry(f"[aipp] {final_text}")
             else:
@@ -117,12 +144,7 @@ def cli_main(cfg: AppConfig, logger: SessionLogger, args: argparse.Namespace):
                 chunk_seconds=int(getattr(cfg, "record_chunk_seconds", 300))
             )
             preserve = bool(args.save_audio) or bool(getattr(cfg, "save_recordings", False))
-            transcriber = WhisperTranscriber(
-                cfg.whisper_model_path,
-                cfg.whisper_binary,
-                delete_input=not preserve,
-                language=cfg.data.get("language", "en"),
-            )
+            transcriber = _make_transcriber(cfg, delete_input=not preserve)
             clipboard = ClipboardManager()
             typer = SimulatedTyper(delay=cfg.typing_delay, start_delay=cfg.typing_start_delay)
 
@@ -146,6 +168,7 @@ def cli_main(cfg: AppConfig, logger: SessionLogger, args: argparse.Namespace):
                         print("[core_runner] No transcript returned.")
                         continue
 
+                    tscript, _was_translated = _translate_logged(tscript, cfg, logger)
                     final_text = get_final_text(tscript, cfg)  # type: ignore[arg-type]
                     clipboard.copy(final_text)
                     print(f"\n📝 ---> ")
@@ -153,7 +176,8 @@ def cli_main(cfg: AppConfig, logger: SessionLogger, args: argparse.Namespace):
                         typer.type(final_text)
                     print()
                     if cfg.aipp_enabled:
-                        logger.log_entry(f"[original] {tscript}")
+                        if not _was_translated:
+                            logger.log_entry(f"[original] {tscript}")
                         if final_text != tscript:
                             logger.log_entry(f"[aipp] {final_text}")
                     else:
@@ -272,12 +296,7 @@ def main():
                 print("Continuous mode | hotkey to rec/stop | Ctrl+C to exit")
             recorder = AudioRecorder()
             preserve = bool(args.save_audio) or bool(getattr(cfg, "save_recordings", False))
-            transcriber = WhisperTranscriber(
-                cfg.whisper_model_path,
-                cfg.whisper_binary,
-                delete_input=not preserve,
-                language=cfg.data.get("language", "en"),
-            )
+            transcriber = _make_transcriber(cfg, delete_input=not preserve)
             clipboard = ClipboardManager()
             typer = SimulatedTyper(delay=cfg.typing_delay, start_delay=cfg.typing_start_delay)
             try:
@@ -295,13 +314,15 @@ def main():
                     if not tscript:
                         print("[cli] No transcript returned.")
                         continue
+                    tscript, _was_translated = _translate_logged(tscript, cfg, logger)
                     final_text = get_final_text(tscript, cfg)  # type: ignore[arg-type]
                     clipboard.copy(final_text)
                     if cfg.typing:
                         typer.type(final_text)
                     print(f"\n📝 ---> {final_text}")
                     if cfg.aipp_enabled:
-                        logger.log_entry(f"[original] {tscript}")
+                        if not _was_translated:
+                            logger.log_entry(f"[original] {tscript}")
                         if final_text != tscript:
                             logger.log_entry(f"[aipp] {final_text}")
                     else:
@@ -311,21 +332,21 @@ def main():
             return
 
         if args.transcribe:
-            transcriber = WhisperTranscriber(
-                cfg.whisper_model_path,
-                cfg.whisper_binary,
-                delete_input=False,
-                language=cfg.data.get("language", "en"),
-            )
+            transcriber = _make_transcriber(cfg, delete_input=False)
             tfile = args.transcribe
             if not Path(tfile).exists():
                 print(f"[cli] File not found: {tfile}")
                 return
             tscript, _ = transcriber.transcribe(tfile)
+            if not tscript:
+                print("[cli] No transcript returned.")
+                return
+            tscript, _was_translated = _translate_logged(tscript, cfg, logger)
             final_text = get_final_text(tscript, cfg)  # type: ignore[arg-type]
             print(f"\n📝 ---> {final_text}")
             if cfg.aipp_enabled:
-                logger.log_entry(f"[original] {tscript}")
+                if not _was_translated:
+                    logger.log_entry(f"[original] {tscript}")
                 if final_text != tscript:
                     logger.log_entry(f"[aipp] {final_text}")
             logger.save()
